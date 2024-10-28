@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "lib": [
+      "ESNext",
+      "DOM",
+      "DOM.Iterable",
+      "ScriptHost"
+    ],
+    "moduleResolution": "node",
+    "target": "ESNext",
+    "module": "commonjs",
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "experimentalDecorators": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "preserveConstEnums": true,
+    "removeComments": false,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "baseUrl": "."
+  },
+  "paths": {
+    "@/": [
+      "./*"
+    ]
+  },
+  "outDir": "dist",
+  "include": [
+    "./*",
+    "common/**/*",
+    "pages/**/*",
+    "widgets/**/*",
+    "commonStatic/**/*",
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

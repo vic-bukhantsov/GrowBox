@@ -7,10 +7,15 @@
 #include <LittleFS.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
+#include <Fonts/FreeSerif24pt7b.h>
+#include <Fonts/FreeMono12pt7b.h>
 #include <Adafruit_ST7789.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
+#include <EEPROM.h>
+#include <CRC32.h>
 #include "radio.h"
+#include "webserver.h"
 
 #define TFT_DC    D1     // TFT DC  pin is connected to NodeMCU pin D1 (GPIO5)
 #define TFT_RST   D2     // TFT RST pin is connected to NodeMCU pin D2 (GPIO4)
@@ -21,14 +26,35 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 int loop_counter = 0;
 RF24Radio radio = RF24Radio();
-ESP8266WebServer server(80);
+WebServer server;
 
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", -18000, 60000); // Update every 60 seconds
+// NTPClient timeClient(ntpUDP, "pool.ntp.org", -18000, 60000); // Update every 60 seconds
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // Update every 60 seconds
+// Offset for Eastern Standard Time (UTC-5)
+const long UTC_OFFSET_EST = -18000;  // UTC-5 hours in seconds
+const long DST_OFFSET = 3600;  // Additional offset of 1 hour for DST
+void adjustTimeOffset(unsigned long epochTime);
+long timezoneOffset = 0;
+
+
 unsigned long previousMillis = 0;
 const long interval = 1000; // 1 second
 bool dotState = false;
 
+#define MODE_MANUAL 1
+#define MODE_AUTO 2
+
+struct StoreData {
+  uint8_t mode;
+  uint8_t power;
+  uint16_t start; // minutes after mignght
+  uint16_t end;   // minutes after mignght
+};
+
+StoreData modeData;
+uint8_t currentPower;
+uint8_t lastSentPower;
 
 const char* ssid = WIFI_SSID;       // Replace with your network SSID
 const char* password = WIFI_PASSWORD; // Replace with your network password
@@ -56,26 +82,46 @@ struct RemoteData {
 SensorData sensors[5];
 RemoteData remote;
 
+void printMode();
 
-void handleRoot() {
-  if (!LittleFS.begin()) {
-    Serial.println("Failed to mount file system");
-    return;
+// Function to calculate CRC32 for the struct
+uint32_t calculateCRC(const StoreData& data) {
+  CRC32 crc;
+  crc.update((const uint8_t*)&data, sizeof(data)); // Calculate CRC from the bytes of the struct
+  return crc.finalize(); // Return the final CRC32 value
+}
+
+
+void saveModeData() {
+  int32_t crc = calculateCRC(modeData);
+  EEPROM.put(0, modeData);           // Write struct at address 0
+  EEPROM.put(sizeof(modeData), crc); // Write CRC checksum after the struct
+  EEPROM.commit();      
+}
+
+void sendPower(int8_t value) {
+  if (value != lastSentPower) {
+    RemoteLight data;
+    data.power = value;
+    data.address = 0x01;
+    data.time = timeClient.getEpochTime();
+
+    radio.sendRemoteLight(data);
+    currentPower = value;
+    lastSentPower = value;
   }
+}
 
-  File file = LittleFS.open("/index.html", "r");
-  if (!file) {
-    Serial.println("Failed to open file");
-    return;
-  }
-
-  String fileContent;
-  while (file.available()) {
-    fileContent += char(file.read());
-  }
-  file.close();
-
-  server.send(200, "text/html", fileContent);
+void onPowerChangeCallback(int8_t value) {
+    if (value == -1) {
+      modeData.mode = MODE_AUTO;
+    } else {
+      modeData.mode = MODE_MANUAL;
+      modeData.power = (uint8_t)value; 
+      sendPower(modeData.power);
+    }
+    saveModeData();
+    printMode();
 }
 
 void printUint32ByBytes(unsigned long value) {
@@ -96,16 +142,58 @@ void printUint32ByBytes(unsigned long value) {
     Serial.println();  // End the line after printing all bytes
 }
 
+
+void printMode() {
+  // print light driver current mode
+
+
+  tft.setFont(&FreeMono12pt7b);
+  tft.fillRect(0, 127, 240, 18, ST77XX_BLACK);
+  tft.setCursor(0, 142);
+  tft.setTextColor(ST77XX_WHITE);
+
+  char line[64];
+  if (modeData.mode == MODE_AUTO) {
+    snprintf(line, sizeof(line), "Auto %i%%(%i)", currentPower, lastSentPower);
+  } else { 
+    snprintf(line, sizeof(line), "Manual %i%%(%i)", currentPower, modeData.power);
+
+  }
+  tft.print(line);
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Setup");
 
+  if (!LittleFS.begin()) {
+      Serial.println("Failed to mount file system");
+      return;
+  }
+
+  EEPROM.begin(512);
+  EEPROM.get(0, modeData);
+  uint32_t crc = calculateCRC(modeData);
+  uint32_t savedCRC;
+  EEPROM.get(sizeof(modeData), savedCRC);
+  
+  if (savedCRC != crc) {
+    Serial.print("Wrong stored EEPROM. Initlizing...");
+    modeData.mode = MODE_MANUAL;
+    modeData.power = 0;
+    modeData.start = 6*60+30;
+    modeData.end = 21*60+30;
+    currentPower = 0;
+    saveModeData();
+  } else {
+    Serial.print("EEPROM is ok.");
+  }
 
   //SPI.begin();
   //SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   SPI.begin();
   SPI.setDataMode(SPI_MODE3);
-  SPI.setFrequency(5000000);
+  //SPI.setFrequency(5000000);
 
   // Reset the display
   pinMode(TFT_RST, OUTPUT);
@@ -123,7 +211,7 @@ void setup() {
   tft.setCursor(0, 0);
   tft.setTextColor(ST77XX_RED);
   tft.setTextSize(2);
-  tft.println("Hello, ST7789!");
+  tft.println("Grow Controller");
 
   WiFi.begin(ssid, password);
 
@@ -159,8 +247,9 @@ void setup() {
     Serial.println("Failed to mount file system");
     return;
   }
-  server.on("/", HTTP_GET, handleRoot);
-  server.begin();
+  server.onChangePowerMode(onPowerChangeCallback);
+  server.setup();
+
 
 
   sensors[0].minValue = 2000;
@@ -179,7 +268,7 @@ void setup() {
     tft.setTextColor(ST77XX_RED);
     tft.println("Radio is not connected!");
   }
-
+  printMode();
   Serial.println("Setup is done");
 
 }
@@ -224,12 +313,14 @@ void processSensorValue(SensorData &sensor, int newValue) {
 
 void loop() {
   MDNS.update();
-  server.handleClient();
+  server.loop();
   loop_counter ++;
   // put your main code here, to run repeatedly:
   //Serial.print("Loop: ");
   //Serial.println(loop_counter);
   //delay(1000);
+  unsigned long epochTime = timeClient.getEpochTime();
+  adjustTimeOffset(epochTime);
 
   bool readStatus = radio.read(&remote, sizeof(remote));
 
@@ -244,29 +335,111 @@ void loop() {
     Serial.println(remote.mode);
     printUint32ByBytes(remote.counter);
     processSensorValue(sensors[0], remote.lastValue);   
-    tft.setTextSize(2);
-    tft.fillRect(0, 100, 240, 24, ST77XX_BLACK);
-    tft.setCursor(0, 100);
+    tft.setFont(&FreeMono12pt7b);
+    tft.fillRect(0, 100, 240, 17, ST77XX_BLACK);
+    tft.setCursor(0, 116);
     tft.setTextColor(ST77XX_GREEN);
     char formattedValue[24];
     sprintf(formattedValue, "%s: %i", timeClient.getFormattedTime().c_str(), sensors[0].lastValue);
     tft.println(formattedValue);
   }
 
+    timeClient.update();
+
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
-    timeClient.update();
+    if (modeData.mode == MODE_AUTO) {
+      int hours = (epochTime  % 86400) / 3600; // Seconds in a day to get hours
+      int minutes = (epochTime % 3600) / 60;   // Seconds in an hour to get minutes
+      int minutesSinceMidnight = (hours * 60) + minutes;
+
+      if (350 <= minutesSinceMidnight &&  minutesSinceMidnight < 360) {
+        sendPower(5);
+      } else if (360 <= minutesSinceMidnight &&  minutesSinceMidnight < 370) {
+        sendPower(10);
+      } else if (370 <= minutesSinceMidnight &&  minutesSinceMidnight < 390) {
+        sendPower(25);
+      } else if (390 <= minutesSinceMidnight &&  minutesSinceMidnight < 420) {
+        sendPower(50);
+      } else if (420 <= minutesSinceMidnight &&  minutesSinceMidnight < 510) {
+        sendPower(100);
+      } else if (510 <= minutesSinceMidnight &&  minutesSinceMidnight < 660) {
+        sendPower(50);
+      } else if (510 <= minutesSinceMidnight &&  minutesSinceMidnight < 900) {
+        sendPower(25);
+      } else if (900 <= minutesSinceMidnight &&  minutesSinceMidnight < 1024) {
+        sendPower(100);
+      } else if (1024 <= minutesSinceMidnight &&  minutesSinceMidnight < 1140) {
+        sendPower(50);
+      } else if (1140 <= minutesSinceMidnight &&  minutesSinceMidnight < 1320) {
+        sendPower(100);
+      } else if (1320 <= minutesSinceMidnight &&  minutesSinceMidnight < 1350) {
+        sendPower(50);
+      } else if (1350 <= minutesSinceMidnight &&  minutesSinceMidnight < 1360) {
+        sendPower(25);
+      } else if (1360 <= minutesSinceMidnight &&  minutesSinceMidnight < 1370) {
+        sendPower(10);
+      } else if (1370 <= minutesSinceMidnight &&  minutesSinceMidnight < 1380) {
+        sendPower(5);
+      } else {
+        sendPower(0);
+      }
+      printMode();
+    }
+
+
+
     String formattedTime = timeClient.getFormattedTime();
 
       // Print the time with blinking dots
-    tft.setTextSize(3);
-    tft.fillRect(0, 40, 240, 24, ST77XX_BLACK);
-    tft.setCursor(0, 40);
+    tft.setFont(&FreeSerif24pt7b);
+    tft.fillRect(0, 40, 240, 42, ST77XX_BLACK);
+    tft.setCursor(0, 80);
     tft.setTextColor(ST77XX_WHITE);
     tft.println(formattedTime);
   }
 }
 
 
+// Helper functions for extracting month, day, and day of the week
+int getMonth(unsigned long epochTime) {
+  epochTime = epochTime % 31556926; // Seconds in a year
+  int month = (epochTime / 2629743) + 1; // Approximation (seconds per month)
+  return month;
+}
+
+int getDay(unsigned long epochTime) {
+  int days = (epochTime / 86400) % 30; // Approximation (seconds per day)
+  return days;
+}
+
+int getDayOfWeek(unsigned long epochTime) {
+  int dayOfWeek = (epochTime / 86400 + 4) % 7; // +4 because Unix time starts on a Thursday
+  return dayOfWeek;
+}
+
+// Function to adjust for DST in Toronto timezone
+void adjustTimeOffset(unsigned long epochTime) {
+  int currentMonth = getMonth(epochTime);
+  int currentDay = getDay(epochTime);
+  int currentDayOfWeek = getDayOfWeek(epochTime); // 0 = Sunday, 6 = Saturday
+
+  // Check if within DST period (second Sunday in March to first Sunday in November)
+  if ((currentMonth > 3 && currentMonth < 11) ||  // DST months (April to October)
+      (currentMonth == 3 && currentDay >= 8 && currentDayOfWeek == 0) ||  // Second Sunday in March
+      (currentMonth == 11 && currentDay < 8 && currentDayOfWeek == 0)) {  // First Sunday in November
+    timeClient.setTimeOffset(UTC_OFFSET_EST + DST_OFFSET);
+  } else {
+    timeClient.setTimeOffset(UTC_OFFSET_EST);
+  }
+}
+
+// Function to get minutes since midnight in local time
+int getMinutesSinceMidnight(unsigned long epochTime) {
+  unsigned long localTime = epochTime;  // Adjust to local time
+  int hours = (localTime  % 86400) / 3600; // Seconds in a day to get hours
+  int minutes = (localTime % 3600) / 60;   // Seconds in an hour to get minutes
+  return (hours * 60) + minutes;
+}
