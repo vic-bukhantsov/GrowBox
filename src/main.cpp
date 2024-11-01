@@ -12,6 +12,7 @@
 #include <Adafruit_ST7789.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
+#include <time.h>
 #include <EEPROM.h>
 #include <CRC32.h>
 #include "radio.h"
@@ -34,7 +35,7 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // Update every 60 secon
 // Offset for Eastern Standard Time (UTC-5)
 const long UTC_OFFSET_EST = -18000;  // UTC-5 hours in seconds
 const long DST_OFFSET = 3600;  // Additional offset of 1 hour for DST
-void adjustTimeOffset(unsigned long epochTime);
+void adjustTimeOffset(const time_t epochTime);
 long timezoneOffset = 0;
 
 
@@ -319,7 +320,7 @@ void loop() {
   //Serial.print("Loop: ");
   //Serial.println(loop_counter);
   //delay(1000);
-  unsigned long epochTime = timeClient.getEpochTime();
+  time_t epochTime= timeClient.getEpochTime();
   adjustTimeOffset(epochTime);
 
   bool readStatus = radio.read(&remote, sizeof(remote));
@@ -404,32 +405,63 @@ void loop() {
 
 
 // Helper functions for extracting month, day, and day of the week
-int getMonth(unsigned long epochTime) {
-  epochTime = epochTime % 31556926; // Seconds in a year
-  int month = (epochTime / 2629743) + 1; // Approximation (seconds per month)
-  return month;
+int getMonth(const time_t epochTime) {
+  struct tm * ti;
+  ti = localtime(&epochTime);
+  int month = (ti->tm_mon + 1) < 10 ? 0 + (ti->tm_mon + 1) : (ti->tm_mon + 1); 
+  return month;  
 }
 
-int getDay(unsigned long epochTime) {
-  int days = (epochTime / 86400) % 30; // Approximation (seconds per day)
-  return days;
+int getDay(const time_t epochTime) {
+  struct tm * ti;
+  ti = localtime (&epochTime);
+  int day = (ti->tm_mday) < 10 ? 0 + (ti->tm_mday) : (ti->tm_mday);
+  
+  return day;  
 }
 
-int getDayOfWeek(unsigned long epochTime) {
-  int dayOfWeek = (epochTime / 86400 + 4) % 7; // +4 because Unix time starts on a Thursday
-  return dayOfWeek;
+int getDayOfWeek(const time_t epochTime) {
+  struct tm * ti;
+  ti = localtime (&epochTime);
+  int wday = ti->tm_wday;
+  return wday;  
+}
+
+bool IsDST(int day, int month, int dow)
+{
+  //January, february, and december are out.
+  if (month < 3 || month > 11) { 
+    return false; 
+  }
+  //April to October are in
+  if (month > 3 && month < 11) { 
+    return true; 
+  }
+  int previousSunday = day - dow;
+  //In march, we are DST if our previous sunday was on or after the 8th.
+  if (month == 3) { 
+    return previousSunday >= 8; 
+  }
+  //In november we must be before the first sunday to be dst.
+  //That means the previous sunday must be before the 1st.
+  return previousSunday <= 0;
 }
 
 // Function to adjust for DST in Toronto timezone
-void adjustTimeOffset(unsigned long epochTime) {
+void adjustTimeOffset(const time_t epochTime) {
   int currentMonth = getMonth(epochTime);
   int currentDay = getDay(epochTime);
   int currentDayOfWeek = getDayOfWeek(epochTime); // 0 = Sunday, 6 = Saturday
 
+  Serial.print("Month: ");
+  Serial.print(currentMonth);
+  Serial.print(" Day: ");
+  Serial.print(currentDay);
+  Serial.print(" DayOfWeek: ");
+  Serial.println(currentDayOfWeek);
+
   // Check if within DST period (second Sunday in March to first Sunday in November)
-  if ((currentMonth > 3 && currentMonth < 11) ||  // DST months (April to October)
-      (currentMonth == 3 && currentDay >= 8 && currentDayOfWeek == 0) ||  // Second Sunday in March
-      (currentMonth == 11 && currentDay < 8 && currentDayOfWeek == 0)) {  // First Sunday in November
+  if (IsDST(currentDay, currentMonth, currentDayOfWeek)) {
     timeClient.setTimeOffset(UTC_OFFSET_EST + DST_OFFSET);
   } else {
     timeClient.setTimeOffset(UTC_OFFSET_EST);

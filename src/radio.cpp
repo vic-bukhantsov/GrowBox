@@ -42,7 +42,7 @@ bool RF24Radio::setup() {
 void RF24Radio::sendRemoteLight(RemoteLight data) {
     Serial.print("Send data ");
     Serial.print(data.time);
-    Serial.print("Power ");
+    Serial.print(" Power ");
     Serial.println(data.power);
     radio.stopListening();
     delay(10);
